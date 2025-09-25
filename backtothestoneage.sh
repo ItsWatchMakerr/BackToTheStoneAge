@@ -10,9 +10,7 @@
 set -euo pipefail
 
 DRY_RUN=0
-if [[ "${1:-}" == "--dry-run" ]]; then
-  DRY_RUN=1
-fi
+[[ "${1:-}" == "--dry-run" ]] && DRY_RUN=1
 
 run() {
   if [[ $DRY_RUN -eq 1 ]]; then
@@ -22,20 +20,16 @@ run() {
   fi
 }
 
-if [[ "$(id -u)" -ne 0 ]]; then
-  echo "Run as root (sudo)."
-  exit 1
-fi
+[[ "$(id -u)" -eq 0 ]] || { echo "Run as root (sudo)."; exit 1; }
 
 echo "=== nuking CLI/Vim/Nano histories (dry-run=${DRY_RUN}) ==="
 
-# Collect home dirs from /etc/passwd + ensure /root
-mapfile -t HOMES < <(getent passwd | awk -F: '{print $6}' | sort -u)
-if ! printf '%s\n' "${HOMES[@]}" | grep -qx "/root"; then
-  HOMES+=("/root")
-fi
+# Only these dirs. No getent, no system accounts.
+TARGET_HOMES=()
+for d in /home/*; do [[ -d "$d" ]] && TARGET_HOMES+=("$d"); done
+TARGET_HOMES+=("/root")
 
-# Exact history files (no globs)
+# Exact files
 HIST_FILES=(
   ".bash_history"
   ".zsh_history"
@@ -45,13 +39,13 @@ HIST_FILES=(
   ".vim/viminfo"
 )
 
-# Vim swap patterns (globs) – safe to remove
+# Vim swap globs
 VIM_SWAP_GLOBS=(
   ".*.swp" "*.swp" ".*.swo" "*.swo"
   ".vimswap*" ".vi.swp" ".vimrc.swp"
 )
 
-for HOME_DIR in "${HOMES[@]}"; do
+for HOME_DIR in "${TARGET_HOMES[@]}"; do
   [[ -d "$HOME_DIR" ]] || continue
   echo ">> $HOME_DIR"
 
@@ -64,10 +58,11 @@ for HOME_DIR in "${HOMES[@]}"; do
     fi
   done
 
-  # Remove vim swap files via globs
+  # Remove vim swap files via globs inside this HOME only
   shopt -s nullglob dotglob
   for gp in "${VIM_SWAP_GLOBS[@]}"; do
     for file in "$HOME_DIR"/$gp; do
+      [[ -f "$file" ]] || continue
       echo "   removing: $file"
       run rm -f -- "$file"
     done
@@ -76,4 +71,4 @@ for HOME_DIR in "${HOMES[@]}"; do
 done
 
 echo "=== done ==="
-echo "Note: active shells still hold in-memory history; users should start a new shell/session."
+echo "Note: active shells keep in-memory history until a new session."
