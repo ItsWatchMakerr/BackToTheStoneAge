@@ -31,23 +31,18 @@ run() {
   fi
 }
 
-# must be root
 if [ "$(id -u)" -ne 0 ]; then
   echo "This script must be run as root (sudo)."
   exit 1
 fi
 
-echo "=== backtothestoneage: starting (dry-run=$DRY_RUN, wipe-logs=$WIPE_LOGS, disable-save=$DISABLE_SAVE) ==="
+echo "=== nuke-histories: starting (dry-run=$DRY_RUN, wipe-logs=$WIPE_LOGS, disable-save=$DISABLE_SAVE) ==="
 
-# gather home directories from passwd (works for users with valid home dirs)
 mapfile -t HOMEDIRS < <(getent passwd | awk -F: '{print $6}' | sort -u)
-
-# ensure /root is included
 if ! printf '%s\n' "${HOMEDIRS[@]}" | grep -qx "/root"; then
   HOMEDIRS+=("/root")
 fi
 
-# list of filename patterns to remove inside each home dir
 read -r -d '' FILE_PATTERNS <<'EOF' || true
 .bash_history
 .bash_logout
@@ -74,28 +69,57 @@ read -r -d '' FILE_PATTERNS <<'EOF' || true
 .gemrc
 EOF
 
-# Also glob patterns for temp/swap files (vim swap, etc.)
-SWAP_PATTERNS=( "*.swp" ".*.swp" ".vimswap*" ".vimrc.swp" ".vimswap*" ".vi.swp" ".*.swo" "*.swo" )
+SWAP_PATTERNS=( "*.swp" ".*.swp" ".vimswap*" ".vimrc.swp" ".*.swo" "*.swo" )
 
-# Remove history files in each home dir (if dir exists)
+# Remove history files in each home dir
 for dir in "${HOMEDIRS[@]}"; do
   [ -d "$dir" ] || continue
   echo "Processing home: $dir"
-  # fix spaces properly
+
+  # Regular (non-glob) and simple path patterns
   while IFS= read -r pattern; do
+    [ -n "$pattern" ] || continue
     target="$dir/$pattern"
-    run bash -c "shopt -s nullglob; files=( $target ); if ((${#files[@]})); then printf ' removing: %s\n' \"\${files[@]}\"; rm -f -- \"\${files[@]}\"; fi"
+
+    # If pattern contains a glob, handle separately below
+    if [[ "$pattern" == *"*"* || "$pattern" == *"?"* || "$pattern" == *"["*"]"* ]]; then
+      # glob pattern
+      shopt -s nullglob dotglob
+      matches=()
+      # quote "$dir"/$pattern to allow globbing while keeping $dir intact
+      for f in "$dir"/$pattern; do
+        matches+=("$f")
+      done
+      if [ ${#matches[@]} -gt 0 ]; then
+        printf ' removing: %s\n' "${matches[@]}"
+        run rm -f -- "${matches[@]}"
+      fi
+      shopt -u nullglob dotglob
+    else
+      # exact path
+      if [ -e "$target" ]; then
+        echo " removing: $target"
+        run rm -f -- "$target"
+      fi
+    fi
   done <<< "$FILE_PATTERNS"
 
-  # remove swap/glob patterns
+  # vim swap and similar globs
+  shopt -s nullglob dotglob
   for gp in "${SWAP_PATTERNS[@]}"; do
-    run bash -c "shopt -s nullglob dotglob; files=( \"$dir\"/$gp ); if ((${#files[@]})); then printf ' removing: %s\n' \"\${files[@]}\"; rm -f -- \"\${files[@]}\"; fi"
+    matches=()
+    for f in "$dir"/$gp; do
+      matches+=("$f")
+    done
+    if [ ${#matches[@]} -gt 0 ]; then
+      printf ' removing: %s\n' "${matches[@]}"
+      run rm -f -- "${matches[@]}"
+    fi
   done
-
-  # also clear .ssh/known_hosts? (optional - not done by default)
+  shopt -u nullglob dotglob
 done
 
-# Additionally try to find any remaining history-like dotfiles across /home and /root and remove them
+# Extra sweep for common history files
 EXTRA_PATTERNS=( ".bash_history" ".zsh_history" ".nano_history" ".viminfo" ".lesshst" ".python_history" ".mysql_history" ".psql_history" )
 for p in "${EXTRA_PATTERNS[@]}"; do
   echo "Searching for $p under /home and /root..."
@@ -108,40 +132,31 @@ for p in "${EXTRA_PATTERNS[@]}"; do
   fi
 done
 
-# Clear shell history for users currently in /proc (best-effort - cannot clear in-memory histories for other shells)
-# We'll attempt to truncate HISTFILE for each live shell if writable
-echo "Attempting best-effort truncation of in-use HISTFILEs for running users..."
-# For each user, try to detect HISTFILE in their environment via /proc/*/environ (best-effort)
+# Best-effort truncation of in-use HISTFILEs
+echo "Attempting best-effort truncation of in-use HISTFILEs for running shells..."
 for pid in $(ps -eo pid=); do
   envfile="/proc/$pid/environ"
   if [ -r "$envfile" ]; then
-    # extract HISTFILE or HOME
-    hist=$(tr '\0' '\n' <"$envfile" 2>/dev/null | awk -F= '/^HISTFILE=/ {print substr($0, index($0,$2))}' | sed -n '1p' || true)
-    home=$(tr '\0' '\n' <"$envfile" 2>/dev/null | awk -F= '/^HOME=/ {print substr($0, index($0,$2))}' | sed -n '1p' || true)
-    if [ -n "$hist" ] && [ -f "$hist" ]; then
-      echo " Truncating $hist (pid $pid)"
+    hist="$(tr '\0' '\n' <"$envfile" 2>/dev/null | awk -F= '/^HISTFILE=/ {print $2; exit}')" || true
+    home="$(tr '\0' '\n' <"$envfile" 2>/dev/null | awk -F= '/^HOME=/ {print $2; exit}')" || true
+    if [ -n "${hist:-}" ] && [ -f "$hist" ]; then
+      echo " truncating: $hist (pid $pid)"
       run : > "$hist"
-    elif [ -n "$home" ]; then
-      # fallback common files
-      pf="$home/.bash_history"
-      if [ -f "$pf" ]; then
-        echo " Truncating $pf (pid $pid)"
-        run : > "$pf"
-      fi
+    elif [ -n "${home:-}" ] && [ -f "$home/.bash_history" ]; then
+      echo " truncating: $home/.bash_history (pid $pid)"
+      run : > "$home/.bash_history"
     fi
   fi
 done
 
-# Optionally truncate /var/log files (destructive)
+# Optional: wipe logs
 if [ "$WIPE_LOGS" -eq 1 ]; then
-  echo "Truncating /var/log files (this is destructive)."
-  # Only truncate regular files (skip sockets, compressed archives)
+  echo "Truncating /var/log files (destructive)."
   mapfile -t LOGFILES < <(find /var/log -type f -maxdepth 4 -mindepth 1 2>/dev/null || true)
   for lf in "${LOGFILES[@]}"; do
     echo " truncating: $lf"
     run truncate -s 0 "$lf"
   done
-  # Also truncate common wtmp/utmp/lastlog if they exist
   for f in /var/log/wtmp /var/log/btmp /var/log/lastlog /var/log/utmp; do
     if [ -e "$f" ]; then
       echo " truncating: $f"
@@ -150,23 +165,24 @@ if [ "$WIPE_LOGS" -eq 1 ]; then
   done
 fi
 
-# Optionally disable future history saving by appending to /etc/profile (idempotent)
+# Optional: disable future history saving
 if [ "$DISABLE_SAVE" -eq 1 ]; then
   echo "Adding history-disable lines to /etc/profile (idempotent)."
-  block="# BEGIN NO-HISTORY ADDED BY backtothestoneage.sh - do not remove unless you intend to enable history again
+  block="# BEGIN NO-HISTORY ADDED BY nuke-histories.sh
 export HISTFILE=/dev/null
 export HISTSIZE=0
 export HISTFILESIZE=0
 # END NO-HISTORY"
-  if grep -q "NO-HISTORY ADDED BY backtothestoneage.sh" /etc/profile 2>/dev/null; then
-    echo " /etc/profile already contains history-disable block, skipping append."
+  if grep -q "NO-HISTORY ADDED BY nuke-histories.sh" /etc/profile 2>/dev/null; then
+    echo " /etc/profile already contains history-disable block, skipping."
   else
-    run bash -c "echo \"$block\" >> /etc/profile"
+    run bash -c "printf '%s\n' \"$block\" >> /etc/profile"
     echo " Appended block to /etc/profile"
   fi
 fi
 
-echo "=== backtothestoneage: completed ==="
+echo "=== nuke-histories: completed ==="
 if [ "$DRY_RUN" -eq 1 ]; then
   echo "NOTE: this was a dry-run. Rerun without --dry-run to perform deletions."
 fi
+
