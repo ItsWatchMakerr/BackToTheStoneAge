@@ -9,12 +9,13 @@
 #   --dry-run      : show what would be done, don't actually delete/truncate
 
 
+
 set -euo pipefail
 
 DRY_RUN=0
 DO_DISABLE=0
 
-# ---- arg parsing (simple & robust) ----
+# ---- arg parsing ----
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --dry-run|-n) DRY_RUN=1; shift ;;
@@ -89,7 +90,7 @@ shopt -u nullglob dotglob
 
 # ---- disable future history (system-wide) ----
 if [[ $DO_DISABLE -eq 1 ]]; then
-  echo "=== disabling future history (bash, zsh, vim, nano) ==="
+  echo "=== disabling future history (bash, zsh-if-present, vim, nano) ==="
 
   # Bash: /etc/profile.d snippet
   bash_snip="/etc/profile.d/00-no-history.sh"
@@ -109,19 +110,16 @@ EOS
     chmod 0644 "$bash_snip"
   fi
 
-  # Zsh: prefer zshenv.d if available, else /etc/zsh/zshenv
-  if [[ -d /etc/zsh/zshenv.d ]]; then
-    zsh_snip="/etc/zsh/zshenv.d/00-no-history.zsh"
-  else
-    zsh_snip="/etc/zsh/zshenv"
-  fi
-  if [[ $DRY_RUN -eq 1 ]]; then
-    echo "[DRY-RUN] ensure and write $zsh_snip"
-  else
-    touch "$zsh_snip"
-    chmod 0644 "$zsh_snip"
-    if ! grep -q "BEGIN NO-HISTORY (nuke-hist-min)" "$zsh_snip" 2>/dev/null; then
-      cat >> "$zsh_snip" <<'EOS'
+  # Zsh: only if zsh exists OR any user uses zsh; create /etc/zsh if needed
+  if command -v zsh >/dev/null 2>&1 || getent passwd | awk -F: '$7 ~ /zsh/ {found=1} END{exit !found}'; then
+    if [[ -d /etc/zsh/zshenv.d ]]; then
+      zsh_snip="/etc/zsh/zshenv.d/00-no-history.zsh"
+      if [[ $DRY_RUN -eq 1 ]]; then
+        echo "[DRY-RUN] write $zsh_snip"
+      else
+        touch "$zsh_snip"; chmod 0644 "$zsh_snip"
+        if ! grep -q "BEGIN NO-HISTORY (nuke-hist-min)" "$zsh_snip" 2>/dev/null; then
+          cat >> "$zsh_snip" <<'EOS'
 # BEGIN NO-HISTORY (nuke-hist-min)
 HISTFILE=/dev/null
 HISTSIZE=0
@@ -130,7 +128,31 @@ setopt NO_HIST_IGNORE_DUPS
 setopt NO_HIST_SAVE_NO_DUPS
 # END NO-HISTORY (nuke-hist-min)
 EOS
+        fi
+      fi
+    else
+      # Ensure /etc/zsh exists, then use /etc/zsh/zshenv
+      if [[ $DRY_RUN -eq 1 ]]; then
+        echo "[DRY-RUN] mkdir -p /etc/zsh && write /etc/zsh/zshenv"
+      else
+        install -d -m 0755 /etc/zsh
+        zsh_snip="/etc/zsh/zshenv"
+        touch "$zsh_snip"; chmod 0644 "$zsh_snip"
+        if ! grep -q "BEGIN NO-HISTORY (nuke-hist-min)" "$zsh_snip" 2>/dev/null; then
+          cat >> "$zsh_snip" <<'EOS'
+# BEGIN NO-HISTORY (nuke-hist-min)
+HISTFILE=/dev/null
+HISTSIZE=0
+SAVEHIST=0
+setopt NO_HIST_IGNORE_DUPS
+setopt NO_HIST_SAVE_NO_DUPS
+# END NO-HISTORY (nuke-hist-min)
+EOS
+        fi
+      fi
     fi
+  else
+    echo "   (zsh not present; skipping zsh config)"
   fi
 
   # Vim: disable viminfo persistence
@@ -139,8 +161,8 @@ EOS
   if [[ $DRY_RUN -eq 1 ]]; then
     echo "[DRY-RUN] ensure and write $vim_sys_rc"
   else
-    touch "$vim_sys_rc"
-    chmod 0644 "$vim_sys_rc"
+    install -d -m 0755 /etc/vim || true
+    touch "$vim_sys_rc"; chmod 0644 "$vim_sys_rc"
     if ! grep -q "nuke-hist-min viminfo" "$vim_sys_rc" 2>/dev/null; then
       printf '%s\n' '" nuke-hist-min viminfo' 'set viminfo=' >> "$vim_sys_rc"
     fi
@@ -150,9 +172,7 @@ EOS
   if [[ $DRY_RUN -eq 1 ]]; then
     echo "[DRY-RUN] modify /etc/nanorc (disable historylog)"
   else
-    touch /etc/nanorc
-    chmod 0644 /etc/nanorc
-    # Comment out any existing 'set historylog' and add 'unset historylog'
+    touch /etc/nanorc; chmod 0644 /etc/nanorc
     sed -i 's/^\s*set\s\+historylog/# disabled by nuke-hist-min: &/' /etc/nanorc || true
     grep -q '^\s*unset\s\+historylog' /etc/nanorc || echo 'unset historylog' >> /etc/nanorc
   fi
