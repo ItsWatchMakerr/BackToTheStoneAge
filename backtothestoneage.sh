@@ -8,35 +8,28 @@
 #   --disable-save : append settings to /etc/profile to stop future history saves
 #   --dry-run      : show what would be done, don't actually delete/truncate
 
+
 set -euo pipefail
 
 DRY_RUN=0
 DO_DISABLE=0
 
-for arg in "${@:-}"; do
-  case "$arg" in
-    --dry-run|-n) DRY_RUN=1 ;;
-    --disable) DO_DISABLE=1 ;;
+# ---- arg parsing (simple & robust) ----
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --dry-run|-n) DRY_RUN=1; shift ;;
+    --disable)    DO_DISABLE=1; shift ;;
     -h|--help)
       cat <<'USAGE'
-nuke-hist-min.sh
-  Remove ONLY bash/zsh/fish, nano, and vim histories for users in /home/* and /root.
-  Optionally disable future history collection (bash, zsh, vim, nano).
-
-Options:
-  --dry-run, -n   Show what would be deleted without deleting
-  --disable       Also write system-wide configs to stop future history saving
-  -h, --help      Show this help
-
-Examples:
-  sudo ./nuke-hist-min.sh --dry-run
-  sudo ./nuke-hist-min.sh
-  sudo ./nuke-hist-min.sh --disable
+Usage:
+  sudo nuke-hist-min.sh             # delete histories
+  sudo nuke-hist-min.sh --dry-run   # preview deletions
+  sudo nuke-hist-min.sh --disable   # delete + disable future history (bash, zsh, vim, nano)
 USAGE
       exit 0
       ;;
-    *) echo "Unknown option: $arg" >&2; exit 2 ;;
-  endesac
+    *) echo "Unknown option: $1" >&2; exit 2 ;;
+  esac
 done
 
 [[ "$(id -u)" -eq 0 ]] || { echo "Run as root (sudo)."; exit 1; }
@@ -94,59 +87,77 @@ for HOME_DIR in "${TARGET_HOMES[@]}"; do
 done
 shopt -u nullglob dotglob
 
+# ---- disable future history (system-wide) ----
 if [[ $DO_DISABLE -eq 1 ]]; then
-  echo "=== writing system-wide 'no history' configs ==="
+  echo "=== disabling future history (bash, zsh, vim, nano) ==="
 
-  # Bash: disable history (all shells)
-  bash_snip='/etc/profile.d/no-history.sh'
-  run "install -m 0644 /dev/null '$bash_snip'"
-  run "cat > '$bash_snip' <<'EOS'
+  # Bash: /etc/profile.d snippet
+  bash_snip="/etc/profile.d/00-no-history.sh"
+  if [[ $DRY_RUN -eq 1 ]]; then
+    echo "[DRY-RUN] write $bash_snip"
+  else
+    cat > "$bash_snip" <<'EOS'
 # Added by nuke-hist-min.sh: disable bash history
 export HISTFILE=/dev/null
 export HISTSIZE=0
 export HISTFILESIZE=0
-# Prevent PROMPT_COMMAND from re-appending history
-unset PROMPT_COMMAND
-EOS"
-
-  # Zsh: disable history
-  # Prefer zshenv.d if present, else append to /etc/zsh/zshenv
-  if [[ -d /etc/zsh/zshenv.d ]]; then
-    zsh_snip='/etc/zsh/zshenv.d/00-no-history.zsh'
-  else
-    zsh_snip='/etc/zsh/zshenv'
+# Avoid auto 'history -a' via PROMPT_COMMAND re-appends
+case "$PROMPT_COMMAND" in
+  *history*) PROMPT_COMMAND="" ;;
+esac
+EOS
+    chmod 0644 "$bash_snip"
   fi
-  # Make sure file exists
-  run "touch '$zsh_snip'"
-  run "chmod 0644 '$zsh_snip'"
-  run "awk 'BEGIN{f=1} /BEGIN NO-HISTORY by nuke-hist-min/{f=0} END{if(f) print \"# BEGIN NO-HISTORY by nuke-hist-min\"}' '$zsh_snip' >/dev/null"
-  run "grep -q 'BEGIN NO-HISTORY by nuke-hist-min' '$zsh_snip' || cat >> '$zsh_snip' <<'EOS'
-# BEGIN NO-HISTORY by nuke-hist-min
+
+  # Zsh: prefer zshenv.d if available, else /etc/zsh/zshenv
+  if [[ -d /etc/zsh/zshenv.d ]]; then
+    zsh_snip="/etc/zsh/zshenv.d/00-no-history.zsh"
+  else
+    zsh_snip="/etc/zsh/zshenv"
+  fi
+  if [[ $DRY_RUN -eq 1 ]]; then
+    echo "[DRY-RUN] ensure and write $zsh_snip"
+  else
+    touch "$zsh_snip"
+    chmod 0644 "$zsh_snip"
+    if ! grep -q "BEGIN NO-HISTORY (nuke-hist-min)" "$zsh_snip" 2>/dev/null; then
+      cat >> "$zsh_snip" <<'EOS'
+# BEGIN NO-HISTORY (nuke-hist-min)
 HISTFILE=/dev/null
 HISTSIZE=0
 SAVEHIST=0
-# END NO-HISTORY by nuke-hist-min
-EOS"
+setopt NO_HIST_IGNORE_DUPS
+setopt NO_HIST_SAVE_NO_DUPS
+# END NO-HISTORY (nuke-hist-min)
+EOS
+    fi
+  fi
 
-  # Vim: stop persisting history
-  # Use vimrc.local if supported, else /etc/vim/vimrc
-  vim_sys_rc='/etc/vim/vimrc'
-  [[ -f /etc/vim/vimrc.local ]] && vim_sys_rc='/etc/vim/vimrc.local'
-  run "touch '$vim_sys_rc'"
-  run "chmod 0644 '$vim_sys_rc'"
-  run "grep -q 'nuke-hist-min viminfo' '$vim_sys_rc' || cat >> '$vim_sys_rc' <<'EOS'
-\" nuke-hist-min viminfo
-set viminfo=
-EOS"
+  # Vim: disable viminfo persistence
+  vim_sys_rc="/etc/vim/vimrc"
+  [[ -f /etc/vim/vimrc.local ]] && vim_sys_rc="/etc/vim/vimrc.local"
+  if [[ $DRY_RUN -eq 1 ]]; then
+    echo "[DRY-RUN] ensure and write $vim_sys_rc"
+  else
+    touch "$vim_sys_rc"
+    chmod 0644 "$vim_sys_rc"
+    if ! grep -q "nuke-hist-min viminfo" "$vim_sys_rc" 2>/dev/null; then
+      printf '%s\n' '" nuke-hist-min viminfo' 'set viminfo=' >> "$vim_sys_rc"
+    fi
+  fi
 
-  # Nano: disable history log
-  run "touch /etc/nanorc"
-  run "chmod 0644 /etc/nanorc"
-  # Remove any existing 'set historylog' and ensure 'unset historylog'
-  run "sed -i 's/^\\s*set\\s\\+historylog/# disabled by nuke-hist-min/g' /etc/nanorc"
-  run "grep -q '^unset\\s\\+historylog' /etc/nanorc || echo 'unset historylog' >> /etc/nanorc"
+  # Nano: ensure history logging is disabled
+  if [[ $DRY_RUN -eq 1 ]]; then
+    echo "[DRY-RUN] modify /etc/nanorc (disable historylog)"
+  else
+    touch /etc/nanorc
+    chmod 0644 /etc/nanorc
+    # Comment out any existing 'set historylog' and add 'unset historylog'
+    sed -i 's/^\s*set\s\+historylog/# disabled by nuke-hist-min: &/' /etc/nanorc || true
+    grep -q '^\s*unset\s\+historylog' /etc/nanorc || echo 'unset historylog' >> /etc/nanorc
+  fi
 
-  echo "=== disable done ==="
+  echo "=== disable complete ==="
 fi
 
 echo "=== done ==="
